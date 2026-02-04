@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Telegram Audio Converter Bot with OpenAI Whisper Transcription
-Converts audio to MP3 and automatically transcribes using OpenAI Whisper API
+Telegram Audio Converter Bot with Google Cloud Speech-to-Text
+Converts audio to MP3 and transcribes using Google Cloud Speech-to-Text API
 """
 
 import os
 import logging
+import json
+import tempfile
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from pydub import AudioSegment
-import tempfile
-from openai import OpenAI
+from google.cloud import speech
+from google.oauth2 import service_account
 
 # Configure logging
 logging.basicConfig(
@@ -19,17 +21,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client
-openai_client = None
+# Initialize Google Cloud Speech client
+speech_client = None
 try:
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-    if openai_api_key:
-        openai_client = OpenAI(api_key=openai_api_key)
-        logger.info("✅ OpenAI Whisper enabled for transcription")
+    # Get credentials from environment variable
+    credentials_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+    if credentials_json:
+        credentials_dict = json.loads(credentials_json)
+        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+        speech_client = speech.SpeechClient(credentials=credentials)
+        logger.info("✅ Google Cloud Speech-to-Text enabled for transcription")
     else:
-        logger.warning("⚠️ OPENAI_API_KEY not set - transcription disabled")
+        logger.warning("⚠️ GOOGLE_APPLICATION_CREDENTIALS_JSON not set - transcription disabled")
 except Exception as e:
-    logger.warning(f"⚠️ OpenAI initialization failed: {e}")
+    logger.warning(f"⚠️ Google Cloud initialization failed: {e}")
 
 # Supported audio formats
 SUPPORTED_FORMATS = ['.m4a', '.ogg', '.opus', '.wav', '.aac', '.flac', '.wma']
@@ -95,47 +100,115 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_message.delete()
             logger.info(f"Successfully converted: {output_filename}")
             
-            # Transcribe with OpenAI Whisper if available
-            if openai_client and file_size_mb <= 25:
+            # Transcribe with Google Cloud Speech-to-Text if available
+            if speech_client and file_size_mb <= 10:  # Google Cloud limit for synchronous: 10MB
                 try:
-                    await message.reply_text("🎙️ Transcribing with OpenAI Whisper...")
+                    await message.reply_text("🎙️ Transcribing with Google Cloud Speech-to-Text...")
                     
+                    # Read the audio file
                     with open(output_path, 'rb') as audio_file:
-                        transcript = openai_client.audio.transcriptions.create(
-                            model="whisper-1",
-                            file=audio_file,
-                            response_format="text"
-                        )
+                        audio_content = audio_file.read()
+                    
+                    # Configure audio and recognition settings
+                    audio = speech.RecognitionAudio(content=audio_content)
+                    config = speech.RecognitionConfig(
+                        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+                        sample_rate_hertz=44100,
+                        language_code="fa-IR",  # Farsi - auto-detection would be "auto"
+                        alternative_language_codes=["en-US", "tr-TR", "ar-SA"],  # English, Turkish, Arabic
+                        enable_automatic_punctuation=True,
+                        model="default",
+                    )
+                    
+                    # Perform transcription
+                    response = speech_client.recognize(config=config, audio=audio)
+                    
+                    # Combine all transcripts
+                    transcript_parts = []
+                    for result in response.results:
+                        transcript_parts.append(result.alternatives[0].transcript)
+                    
+                    full_transcript = " ".join(transcript_parts)
                     
                     # Send transcription
-                    if transcript and len(transcript.strip()) > 0:
+                    if full_transcript and len(full_transcript.strip()) > 0:
                         # Split long transcripts
                         max_length = 4000
-                        if len(transcript) <= max_length:
+                        if len(full_transcript) <= max_length:
                             await message.reply_text(
-                                f"📝 **Transcription:**\n\n{transcript}",
+                                f"📝 **Transcription:**\n\n{full_transcript}",
                                 parse_mode="Markdown"
                             )
                         else:
                             # Split into chunks
-                            chunks = [transcript[i:i+max_length] for i in range(0, len(transcript), max_length)]
+                            chunks = [full_transcript[i:i+max_length] for i in range(0, len(full_transcript), max_length)]
                             for i, chunk in enumerate(chunks):
                                 await message.reply_text(
                                     f"📝 **Transcription (Part {i+1}/{len(chunks)}):**\n\n{chunk}",
                                     parse_mode="Markdown"
                                 )
-                        logger.info(f"Transcription completed: {len(transcript)} chars")
+                        logger.info(f"Transcription completed: {len(full_transcript)} chars")
                     else:
-                        await message.reply_text("⚠️ Transcription was empty")
+                        await message.reply_text("⚠️ No speech detected in audio")
                         
                 except Exception as e:
-                    logger.error(f"Transcription error: {e}")
+                    logger.error(f"Transcription error: {e}", exc_info=True)
                     await message.reply_text(f"⚠️ Transcription failed: {str(e)}")
-            elif openai_client and file_size_mb > 25:
-                await message.reply_text(
-                    f"⚠️ File too large for transcription ({file_size_mb:.1f} MB)\n"
-                    f"OpenAI Whisper limit: 25 MB"
-                )
+            elif speech_client and file_size_mb > 10:
+                # For larger files, use async long-running operation
+                try:
+                    await message.reply_text("🎙️ Transcribing large file with Google Cloud (this may take a few minutes)...")
+                    
+                    # Read audio file
+                    with open(output_path, 'rb') as audio_file:
+                        audio_content = audio_file.read()
+                    
+                    # Configure for long audio
+                    audio = speech.RecognitionAudio(content=audio_content)
+                    config = speech.RecognitionConfig(
+                        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+                        sample_rate_hertz=44100,
+                        language_code="fa-IR",
+                        alternative_language_codes=["en-US", "tr-TR", "ar-SA"],
+                        enable_automatic_punctuation=True,
+                        model="default",
+                    )
+                    
+                    # Start long-running operation
+                    operation = speech_client.long_running_recognize(config=config, audio=audio)
+                    logger.info("Waiting for long-running operation to complete...")
+                    
+                    response = operation.result(timeout=300)  # 5 minute timeout
+                    
+                    # Combine transcripts
+                    transcript_parts = []
+                    for result in response.results:
+                        transcript_parts.append(result.alternatives[0].transcript)
+                    
+                    full_transcript = " ".join(transcript_parts)
+                    
+                    if full_transcript and len(full_transcript.strip()) > 0:
+                        # Split and send
+                        max_length = 4000
+                        if len(full_transcript) <= max_length:
+                            await message.reply_text(
+                                f"📝 **Transcription:**\n\n{full_transcript}",
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            chunks = [full_transcript[i:i+max_length] for i in range(0, len(full_transcript), max_length)]
+                            for i, chunk in enumerate(chunks):
+                                await message.reply_text(
+                                    f"📝 **Transcription (Part {i+1}/{len(chunks)}):**\n\n{chunk}",
+                                    parse_mode="Markdown"
+                                )
+                        logger.info(f"Long transcription completed: {len(full_transcript)} chars")
+                    else:
+                        await message.reply_text("⚠️ No speech detected in audio")
+                        
+                except Exception as e:
+                    logger.error(f"Long transcription error: {e}", exc_info=True)
+                    await message.reply_text(f"⚠️ Long transcription failed: {str(e)}")
             
     except Exception as e:
         logger.error(f"Error converting audio: {e}", exc_info=True)
