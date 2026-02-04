@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Audio Converter Bot - Railway Optimized Version
-Automatically converts audio files to MP3 format
+Telegram Audio Converter Bot with OpenAI Whisper Transcription
+Converts audio to MP3 and automatically transcribes using OpenAI Whisper API
 """
 
 import os
@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from pydub import AudioSegment
 import tempfile
+from openai import OpenAI
 
 # Configure logging
 logging.basicConfig(
@@ -17,6 +18,18 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Initialize OpenAI client
+openai_client = None
+try:
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    if openai_api_key:
+        openai_client = OpenAI(api_key=openai_api_key)
+        logger.info("✅ OpenAI Whisper enabled for transcription")
+    else:
+        logger.warning("⚠️ OPENAI_API_KEY not set - transcription disabled")
+except Exception as e:
+    logger.warning(f"⚠️ OpenAI initialization failed: {e}")
 
 # Supported audio formats
 SUPPORTED_FORMATS = ['.m4a', '.ogg', '.opus', '.wav', '.aac', '.flac', '.wma']
@@ -71,7 +84,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
             duration_mins = len(audio) / 60000
             
-            # Send converted file
+            # Send converted MP3
             with open(output_path, 'rb') as mp3_file:
                 await message.reply_document(
                     document=mp3_file,
@@ -81,6 +94,48 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await status_message.delete()
             logger.info(f"Successfully converted: {output_filename}")
+            
+            # Transcribe with OpenAI Whisper if available
+            if openai_client and file_size_mb <= 25:
+                try:
+                    await message.reply_text("🎙️ Transcribing with OpenAI Whisper...")
+                    
+                    with open(output_path, 'rb') as audio_file:
+                        transcript = openai_client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_file,
+                            response_format="text"
+                        )
+                    
+                    # Send transcription
+                    if transcript and len(transcript.strip()) > 0:
+                        # Split long transcripts
+                        max_length = 4000
+                        if len(transcript) <= max_length:
+                            await message.reply_text(
+                                f"📝 **Transcription:**\n\n{transcript}",
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            # Split into chunks
+                            chunks = [transcript[i:i+max_length] for i in range(0, len(transcript), max_length)]
+                            for i, chunk in enumerate(chunks):
+                                await message.reply_text(
+                                    f"📝 **Transcription (Part {i+1}/{len(chunks)}):**\n\n{chunk}",
+                                    parse_mode="Markdown"
+                                )
+                        logger.info(f"Transcription completed: {len(transcript)} chars")
+                    else:
+                        await message.reply_text("⚠️ Transcription was empty")
+                        
+                except Exception as e:
+                    logger.error(f"Transcription error: {e}")
+                    await message.reply_text(f"⚠️ Transcription failed: {str(e)}")
+            elif openai_client and file_size_mb > 25:
+                await message.reply_text(
+                    f"⚠️ File too large for transcription ({file_size_mb:.1f} MB)\n"
+                    f"OpenAI Whisper limit: 25 MB"
+                )
             
     except Exception as e:
         logger.error(f"Error converting audio: {e}", exc_info=True)
