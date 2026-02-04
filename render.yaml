@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: telegram-audio-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 audio_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: 8400464691:AAETt_M0L63C3Lwgy9O_nE04NdKjOV2Xvkc
+    disk:
+      name: bot-data
+      mountPath: /tmp
+      sizeGB: 1
