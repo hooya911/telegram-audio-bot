@@ -44,7 +44,7 @@ try:
         
         # Initialize Vertex AI (uses same credentials as Cloud Storage!)
         vertexai.init(project=project_id, location="us-central1", credentials=credentials)
-        gemini_model = GenerativeModel("gemini-1.5-pro-002")
+        gemini_model = GenerativeModel("gemini-2.5-flash")
         
         logger.info("✅ Google Gemini (Vertex AI) enabled - Notebook LLM quality!")
         logger.info(f"✅ Using project: {project_id}")
