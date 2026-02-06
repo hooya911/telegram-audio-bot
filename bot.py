@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Audio Converter Bot with Google Gemini
-Converts audio to MP3 and transcribes using Gemini API (same as Notebook LLM!)
+Telegram Audio Converter Bot with Google Gemini (Vertex AI)
+Converts audio to MP3 and transcribes using Gemini via Vertex AI
 """
 
 import os
@@ -14,7 +14,8 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from pydub import AudioSegment
 from google.cloud import storage
 from google.oauth2 import service_account
-import google.generativeai as genai
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part
 
 # Configure logging
 logging.basicConfig(
@@ -23,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Google Cloud Storage and Gemini
+# Initialize Google Cloud Storage and Vertex AI Gemini
 storage_client = None
 project_id = None
 bucket_name = None
@@ -41,16 +42,16 @@ try:
         project_id = credentials_dict['project_id']
         bucket_name = f"{project_id}-telegram-bot-temp"
         
-        # Initialize Gemini (uses same credentials)
-        genai.configure(credentials=credentials)
-        gemini_model = genai.GenerativeModel('gemini-1.5-pro')  # Best for audio transcription
+        # Initialize Vertex AI (uses same credentials as Cloud Storage!)
+        vertexai.init(project=project_id, location="us-central1", credentials=credentials)
+        gemini_model = GenerativeModel("gemini-1.5-pro")
         
-        logger.info("✅ Google Gemini enabled for transcription (same as Notebook LLM!)")
-        logger.info(f"✅ Google Cloud Storage enabled - bucket: {bucket_name}")
+        logger.info("✅ Google Gemini (Vertex AI) enabled - Notebook LLM quality!")
+        logger.info(f"✅ Using project: {project_id}")
     else:
         logger.warning("⚠️ GOOGLE_APPLICATION_CREDENTIALS_JSON not set - transcription disabled")
 except Exception as e:
-    logger.warning(f"⚠️ Google Cloud initialization failed: {e}")
+    logger.warning(f"⚠️ Initialization failed: {e}")
 
 # Supported audio formats
 SUPPORTED_FORMATS = ['.m4a', '.ogg', '.opus', '.wav', '.aac', '.flac', '.wma']
@@ -116,62 +117,60 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_message.delete()
             logger.info(f"Successfully converted: {output_filename}")
             
-            # Transcribe with Gemini (same as Notebook LLM!)
+            # Transcribe with Vertex AI Gemini (same as Notebook LLM!)
             if gemini_model and storage_client:
                 try:
                     await message.reply_text(
-                        f"🎙️ Transcribing with Google Gemini (Notebook LLM quality)...\n"
-                        f"File size: {file_size_mb:.1f} MB | Duration: {duration_mins:.1f} min"
+                        f"🎙️ Transcribing with Gemini (Notebook LLM quality)...\n"
+                        f"File: {file_size_mb:.1f} MB | Duration: {duration_mins:.1f} min"
                     )
                     
-                    # Upload to Cloud Storage for Gemini
+                    # Upload to Cloud Storage for Vertex AI
                     try:
                         bucket = storage_client.bucket(bucket_name)
                         if not bucket.exists():
                             logger.info(f"Creating bucket: {bucket_name}")
                             bucket = storage_client.create_bucket(bucket_name, location="us")
-                            logger.info(f"✅ Bucket created: {bucket_name}")
                     except Exception as e:
                         logger.error(f"Bucket error: {e}")
-                        await message.reply_text(f"⚠️ Storage setup failed: {str(e)}")
+                        await message.reply_text(f"⚠️ Storage setup failed")
                         return
                     
                     # Upload audio file
                     blob_name = f"audio_{uuid.uuid4()}.mp3"
                     blob = bucket.blob(blob_name)
-                    logger.info(f"Uploading {blob_name}...")
+                    logger.info(f"Uploading to Cloud Storage...")
                     blob.upload_from_filename(output_path)
                     
-                    # Get public URL (Gemini needs it)
                     gcs_uri = f"gs://{bucket_name}/{blob_name}"
+                    logger.info(f"File uploaded: {gcs_uri}")
                     
-                    await message.reply_text("☁️ File uploaded! Starting Gemini transcription...")
+                    await message.reply_text("☁️ Processing audio with Gemini...")
                     
-                    # Upload file to Gemini
-                    audio_file = genai.upload_file(path=output_path)
-                    logger.info(f"File uploaded to Gemini: {audio_file.name}")
+                    # Create audio part for Vertex AI
+                    audio_part = Part.from_uri(gcs_uri, mime_type="audio/mpeg")
                     
-                    # Create comprehensive prompt for Farsi
-                    prompt = """Transcribe this audio accurately. 
-                    
-                    Instructions:
-                    - Transcribe exactly what is said
-                    - Preserve the original language (Farsi, English, Turkish, Arabic, etc.)
-                    - Include proper punctuation
-                    - If multiple speakers, identify them
-                    - Do NOT summarize - provide complete word-for-word transcription
-                    - Maintain natural flow and sentence structure
-                    
-                    Provide only the transcription, nothing else."""
+                    # Comprehensive prompt for best transcription
+                    prompt = """Transcribe this audio recording accurately and completely.
+
+Instructions:
+- Transcribe every word exactly as spoken
+- Preserve the original language (do not translate)
+- Include proper punctuation and capitalization
+- If multiple speakers, note speaker changes
+- Maintain natural flow and phrasing
+- Do NOT summarize - provide word-for-word transcription
+
+Provide only the complete transcription."""
                     
                     # Generate transcription
-                    logger.info("Generating transcription with Gemini...")
-                    response = gemini_model.generate_content([prompt, audio_file])
+                    logger.info("Generating transcription with Vertex AI Gemini...")
+                    response = gemini_model.generate_content([prompt, audio_part])
                     
-                    # Clean up Storage
+                    # Clean up
                     try:
                         blob.delete()
-                        logger.info(f"✅ Deleted {blob_name} from Cloud Storage")
+                        logger.info("✅ Cleaned up Cloud Storage")
                     except:
                         pass
                     
@@ -179,11 +178,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     full_transcript = response.text.strip()
                     
                     if full_transcript and len(full_transcript) > 0:
-                        # Split long transcripts for Telegram
+                        # Split for Telegram's message limit
                         max_length = 4000
                         if len(full_transcript) <= max_length:
                             await message.reply_text(
-                                f"📝 **Transcription (Gemini):**\n\n{full_transcript}",
+                                f"📝 **Transcription:**\n\n{full_transcript}",
                                 parse_mode="Markdown"
                             )
                         else:
@@ -191,19 +190,19 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     for i in range(0, len(full_transcript), max_length)]
                             for i, part in enumerate(parts):
                                 await message.reply_text(
-                                    f"📝 **Transcription Part {i+1}/{len(parts)}:**\n\n{part}",
+                                    f"📝 **Part {i+1}/{len(parts)}:**\n\n{part}",
                                     parse_mode="Markdown"
                                 )
-                        logger.info(f"✅ Gemini transcription completed: {len(full_transcript)} chars")
+                        logger.info(f"✅ Transcription completed: {len(full_transcript)} chars")
                     else:
                         await message.reply_text("⚠️ No transcription generated")
                         
                 except Exception as e:
-                    logger.error(f"Gemini transcription error: {e}", exc_info=True)
+                    logger.error(f"Transcription error: {e}", exc_info=True)
                     await message.reply_text(f"⚠️ Transcription failed: {str(e)}")
             
     except Exception as e:
-        logger.error(f"Error converting audio: {e}", exc_info=True)
+        logger.error(f"Error: {e}", exc_info=True)
         await status_message.edit_text(f"❌ Error: {str(e)}")
 
 def main():
