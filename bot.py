@@ -15,7 +15,7 @@ from pydub import AudioSegment
 from google.cloud import storage
 from google.oauth2 import service_account
 import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+from vertexai.preview.generative_models import GenerativeModel, Part
 
 # Configure logging
 logging.basicConfig(
