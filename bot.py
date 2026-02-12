@@ -50,9 +50,18 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             # Download file
-            file = await audio_file.get_file()
-            input_path = os.path.join(temp_dir, "input_audio")
-            await file.download_to_drive(input_path)
+            try:
+                file = await audio_file.get_file()
+                input_path = os.path.join(temp_dir, "input_audio")
+                await file.download_to_drive(input_path)
+            except Exception as download_error:
+                await status_message.edit_text(
+                    f"❌ Download failed: {str(download_error)}\n\n"
+                    f"This might be a Telegram API limit.\n"
+                    f"Try sending a shorter audio clip."
+                )
+                logger.error(f"Download error: {download_error}", exc_info=True)
+                return
             
             # Convert to MP3
             base_name = os.path.splitext(original_filename)[0]
@@ -60,10 +69,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             output_path = os.path.join(temp_dir, output_filename)
             
             audio = AudioSegment.from_file(input_path)
+            
+            # High quality MP3 for transcription
             audio.export(
                 output_path,
                 format="mp3",
-                bitrate="128k",
+                bitrate="128k",  # High quality for accurate transcription
                 parameters=["-ar", "44100"]
             )
             
