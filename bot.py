@@ -93,9 +93,14 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
             content=chunk_bytes,
         )
 
-        response = await loop.run_in_executor(
-            None, lambda r=request: client.recognize(request=r)
-        )
+        try:
+            response = await loop.run_in_executor(
+                None, lambda r=request: client.recognize(request=r)
+            )
+        except Exception as chunk_err:
+            logger.error(f"Chunk {idx + 1}/{len(chunks)} failed: {chunk_err}")
+            all_lines.append(f"[chunk {idx + 1} failed: {chunk_err}]")
+            continue
 
         for result in response.results:
             if not result.alternatives:
@@ -136,7 +141,7 @@ async def summarize_with_gemini(transcription: str, duration_mins: float) -> str
         raise ValueError("GEMINI_API_KEY is not set")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
     prompt = f"""You are summarizing a {duration_mins:.1f}-minute audio recording that was transcribed from mixed Farsi and English speech.
 
@@ -341,11 +346,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         try:
                             summary = await summarize_with_gemini(transcription, duration_mins)
                             await summary_status.delete()
-                            header = f"📋 *Summary* — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
-                            await message.reply_text(
-                                header + summary,
-                                parse_mode='Markdown'
-                            )
+                            header = f"📋 Summary — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
+                            await message.reply_text(header + summary)
                             logger.info("✅ Summary sent")
                         except Exception as sum_error:
                             await summary_status.edit_text(
