@@ -25,7 +25,9 @@ SUPPORTED_FORMATS = ['.m4a', '.ogg', '.opus', '.wav', '.aac', '.flac', '.wma', '
 
 
 async def transcribe_with_chirp(mp3_path: str) -> str:
-    """Transcribe audio using Google Cloud Speech-to-Text Chirp 3 model"""
+    """Transcribe audio using Google Cloud Speech-to-Text Chirp 3 model.
+    Splits audio into 55-second chunks to stay under the 60s API limit.
+    """
     import json
     from google.cloud.speech_v2 import SpeechClient
     from google.cloud.speech_v2.types import cloud_speech
@@ -46,101 +48,83 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )
 
-    STT_LIMIT_BYTES = 10 * 1024 * 1024  # 10 MB inline limit for Chirp 3
-    stt_path = mp3_path
-    tmp_stt = None
+    client_options = ClientOptions(api_endpoint="us-speech.googleapis.com")
+    client = SpeechClient(credentials=credentials, client_options=client_options)
 
-    if os.path.getsize(mp3_path) > STT_LIMIT_BYTES:
-        from pydub import AudioSegment
-        import tempfile
-        audio = AudioSegment.from_file(mp3_path)
-        tmp_stt = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
-        tmp_stt.close()
-        # 16kbps mono 16kHz — enough for STT, ~87 min fits in 10MB
-        audio.export(tmp_stt.name, format="mp3", bitrate="16k",
-                     parameters=["-ar", "16000", "-ac", "1"])
-        compressed_size = os.path.getsize(tmp_stt.name)
-        if compressed_size > STT_LIMIT_BYTES:
-            os.unlink(tmp_stt.name)
-            raise ValueError(
-                f"Audio is too long to transcribe (~{compressed_size/1024/1024:.0f} MB even at minimum quality). "
-                f"Maximum is ~90 minutes."
-            )
-        logger.info(
-            f"Compressed for STT: {os.path.getsize(mp3_path)/1024/1024:.1f} MB "
-            f"→ {compressed_size/1024/1024:.1f} MB"
-        )
-        stt_path = tmp_stt.name
+    config = cloud_speech.RecognitionConfig(
+        auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
+        model="chirp_3",
+        language_codes=["fa-IR", "en-US"],
+        features=cloud_speech.RecognitionFeatures(
+            enable_automatic_punctuation=True,
+            enable_word_time_offsets=True,
+        ),
+    )
+    recognizer_path = f"projects/{project_id}/locations/us/recognizers/_"
 
-    try:
-        with open(stt_path, 'rb') as f:
-            audio_bytes = f.read()
-    finally:
-        if tmp_stt and os.path.exists(tmp_stt.name):
-            os.unlink(tmp_stt.name)
+    # Split into 55-second chunks (API hard limit is 60s per request)
+    audio = AudioSegment.from_file(mp3_path)
+    CHUNK_MS = 55 * 1000
+    chunks = [audio[i:i + CHUNK_MS] for i in range(0, len(audio), CHUNK_MS)]
+    logger.info(f"Transcribing {len(chunks)} chunk(s) with Chirp 3...")
 
     loop = asyncio.get_event_loop()
+    all_lines = []
+    last_timestamp_seconds = -120  # force first timestamp at [0:00]
 
-    def do_transcribe():
-        client_options = ClientOptions(api_endpoint="us-speech.googleapis.com")
-        client = SpeechClient(
-            credentials=credentials,
-            client_options=client_options
-        )
+    for idx, chunk in enumerate(chunks):
+        chunk_offset_secs = idx * 55
 
-        config = cloud_speech.RecognitionConfig(
-            auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
-            model="chirp_3",
-            language_codes=["fa-IR", "en-US"],
-            features=cloud_speech.RecognitionFeatures(
-                enable_automatic_punctuation=True,
-                enable_word_time_offsets=True,
-            ),
-        )
+        # Export chunk to a low-bitrate temp file (16kbps mono — enough for STT)
+        tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+        tmp.close()
+        try:
+            chunk.export(tmp.name, format="mp3", bitrate="16k",
+                         parameters=["-ar", "16000", "-ac", "1"])
+            with open(tmp.name, 'rb') as f:
+                chunk_bytes = f.read()
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
-        recognizer_path = f"projects/{project_id}/locations/us/recognizers/_"
         request = cloud_speech.RecognizeRequest(
             recognizer=recognizer_path,
             config=config,
-            content=audio_bytes
+            content=chunk_bytes,
         )
 
-        logger.info("Sending audio to Chirp 3 (Google Cloud Speech-to-Text)...")
-        return client.recognize(request=request)
+        response = await loop.run_in_executor(
+            None, lambda r=request: client.recognize(request=r)
+        )
 
-    response = await loop.run_in_executor(None, do_transcribe)
+        for result in response.results:
+            if not result.alternatives:
+                continue
+            best = result.alternatives[0]
+            text = best.transcript.strip()
+            if not text:
+                continue
 
-    # Assemble transcription with timestamps every ~2 minutes
-    lines = []
-    last_timestamp_seconds = -120  # Force first timestamp at [0:00]
+            # Timestamp every ~2 minutes, adjusted for chunk offset
+            if best.words:
+                try:
+                    offset = best.words[0].start_offset
+                    if hasattr(offset, 'total_seconds'):
+                        word_secs = int(offset.total_seconds())
+                    else:
+                        word_secs = int(offset.seconds + offset.nanos / 1e9)
+                    start_secs = chunk_offset_secs + word_secs
+                    if start_secs - last_timestamp_seconds >= 120:
+                        mins = start_secs // 60
+                        secs = start_secs % 60
+                        all_lines.append(f"[{mins}:{secs:02d}]")
+                        last_timestamp_seconds = start_secs
+                except Exception:
+                    pass
 
-    for result in response.results:
-        if not result.alternatives:
-            continue
-        best = result.alternatives[0]
-        text = best.transcript.strip()
-        if not text:
-            continue
+            all_lines.append(text)
 
-        # Insert timestamp every ~2 minutes using word timing
-        if best.words:
-            try:
-                offset = best.words[0].start_offset
-                if hasattr(offset, 'total_seconds'):
-                    start_secs = int(offset.total_seconds())
-                else:
-                    start_secs = int(offset.seconds + offset.nanos / 1e9)
-                if start_secs - last_timestamp_seconds >= 120:
-                    mins = start_secs // 60
-                    secs = start_secs % 60
-                    lines.append(f"[{mins}:{secs:02d}]")
-                    last_timestamp_seconds = start_secs
-            except Exception:
-                pass
-
-        lines.append(text)
-
-    return "\n".join(lines) if lines else "No speech detected in audio"
+    return "\n".join(all_lines) if all_lines else "No speech detected in audio"
 
 
 async def send_transcription(message, transcription: str, duration_mins: float):
