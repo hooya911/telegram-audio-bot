@@ -127,6 +127,36 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
     return "\n".join(all_lines) if all_lines else "No speech detected in audio"
 
 
+async def summarize_with_gemini(transcription: str, duration_mins: float) -> str:
+    """Send transcription to Gemini and return a detailed summary."""
+    import google.generativeai as genai
+
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set")
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    prompt = f"""You are summarizing a {duration_mins:.1f}-minute audio recording that was transcribed from mixed Farsi and English speech.
+
+TRANSCRIPTION:
+{transcription}
+
+Write a detailed summary of everything discussed. Follow these rules:
+- Summarize in the same language(s) as the speaker used — Farsi parts in Persian script (فارسی), English parts in English
+- Use clear sections/bullet points to organize the key topics
+- Cover all main points, decisions, and important details — do not skip anything significant
+- Keep it concise but comprehensive (not a word-for-word repeat)
+- If the audio is mostly Farsi, write the summary mostly in Farsi; if mostly English, mostly English"""
+
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(
+        None, lambda: model.generate_content(prompt)
+    )
+    return response.text.strip()
+
+
 async def send_transcription(message, transcription: str, duration_mins: float):
     """Send transcription text to Telegram, splitting if needed (4096 char limit)"""
     TELEGRAM_LIMIT = 4000  # Leave some buffer below 4096
@@ -302,6 +332,27 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     transcription = await transcribe_with_chirp(final_mp3_path)
                     await transcription_status.delete()
                     await send_transcription(message, transcription, duration_mins)
+
+                    # ── Summary (optional, only if GEMINI_API_KEY is set) ──
+                    if os.getenv('GEMINI_API_KEY'):
+                        summary_status = await message.reply_text(
+                            "🤖 Generating summary with Gemini..."
+                        )
+                        try:
+                            summary = await summarize_with_gemini(transcription, duration_mins)
+                            await summary_status.delete()
+                            header = f"📋 *Summary* — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
+                            await message.reply_text(
+                                header + summary,
+                                parse_mode='Markdown'
+                            )
+                            logger.info("✅ Summary sent")
+                        except Exception as sum_error:
+                            await summary_status.edit_text(
+                                f"⚠️ Summary failed: {str(sum_error)}\n"
+                                f"✅ Transcription was still sent above"
+                            )
+                            logger.error(f"Summary error: {sum_error}", exc_info=True)
 
                 except Exception as trans_error:
                     await transcription_status.edit_text(
