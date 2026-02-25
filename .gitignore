@@ -1,39 +1,21 @@
-# Environment variables (contains sensitive token!)
-.env
-
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+*.pyo
+.env
+*.env
 
-# Logs
-*.log
+# Nested subfolder (not part of deployment)
+telegram-audio-bot/
 
-# Temporary files
-*.tmp
-temp/
-tmp/
+# Credentials (never commit these)
+*.json
+google-credentials.json
 
 # OS files
 .DS_Store
 Thumbs.db
+
+# Temp files
+*.tmp
+*.log
