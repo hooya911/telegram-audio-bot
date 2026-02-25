@@ -2,14 +2,16 @@
 """
 Telegram Audio Converter Bot
 - Converts any audio format to MP3
-- Transcribes audio using Gemini Files API (Farsi + English, any length)
+- Transcribes audio using Google Cloud Speech-to-Text Chirp 3 (Farsi + English)
 - Generates AI summary using Gemini
 """
 
 import os
+import math
 import logging
 import tempfile
 import asyncio
+import subprocess
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from pydub import AudioSegment
@@ -25,100 +27,39 @@ logger = logging.getLogger(__name__)
 SUPPORTED_FORMATS = ['.m4a', '.ogg', '.opus', '.wav', '.aac', '.flac', '.wma', '.mp3']
 
 
-async def transcribe_with_gemini_files(mp3_path: str) -> str:
-    """Transcribe audio using Gemini Files API.
+def _get_audio_duration_secs(path: str) -> float:
+    """Return audio duration in seconds using ffprobe (no file load into RAM)."""
+    import json
 
-    Uploads the full audio file to Google's servers and transcribes it there —
-    no chunking, no memory limits on the bot, no truncation for long files.
-    Supports files up to 2 GB / ~9 hours of audio.
-    """
-    import google.generativeai as genai
-    import time
-
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set")
-
-    genai.configure(api_key=api_key)
-    loop = asyncio.get_running_loop()
-
-    # Step 1: Upload file to Gemini Files API
-    file_size_mb = os.path.getsize(mp3_path) / (1024 * 1024)
-    logger.info(f"Uploading {file_size_mb:.1f} MB audio to Gemini Files API...")
-
-    audio_file = await loop.run_in_executor(
-        None,
-        lambda: genai.upload_file(path=mp3_path, mime_type="audio/mpeg")
+    # Try stream-level duration first
+    probe = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', path],
+        capture_output=True, text=True
     )
-    logger.info(f"Upload complete. File: {audio_file.name}, State: {audio_file.state.name}")
-
-    # Step 2: Wait for file to become ACTIVE (Google processes it server-side)
-    start = time.time()
-    while audio_file.state.name == "PROCESSING":
-        if time.time() - start > 600:  # 10-minute timeout
-            raise TimeoutError("Gemini file processing timed out (>10 min)")
-        logger.info("Gemini is processing the file... waiting 10s")
-        await asyncio.sleep(10)
-        audio_file = await loop.run_in_executor(
-            None, lambda: genai.get_file(audio_file.name)
-        )
-
-    if audio_file.state.name != "ACTIVE":
-        raise RuntimeError(f"Gemini file processing failed. State: {audio_file.state.name}")
-
-    logger.info("File is ACTIVE — starting transcription...")
-
-    # Step 3: Transcribe with Gemini — full file, no truncation
-    prompt = """Transcribe this audio recording completely from beginning to end.
-
-Rules:
-- Write Farsi/Persian speech in Persian script (فارسی)
-- Write English speech in English
-- Do NOT translate — transcribe exactly as spoken in the original language
-- Add a timestamp every ~2 minutes in format [MM:SS]
-- Mark unclear sections as [unclear]
-- Transcribe the ENTIRE audio from start to finish — do not skip, summarize, or stop early"""
-
-    # Try models in order — gemini-1.5-pro handles up to ~9.5 hours of audio
-    candidate_models = [
-        "gemini-1.5-pro",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-    ]
-
-    transcription = None
-    last_error = None
-    for model_name in candidate_models:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = await loop.run_in_executor(
-                None, lambda m=model: m.generate_content([prompt, audio_file])
-            )
-            transcription = response.text.strip()
-            logger.info(f"Transcription done — model: {model_name}, chars: {len(transcription)}")
-            break
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed: {e}")
-            last_error = e
-            continue
-
-    # Step 4: Clean up uploaded file from Gemini (free up quota)
     try:
-        await loop.run_in_executor(None, lambda: genai.delete_file(audio_file.name))
-        logger.info("Cleaned up Gemini uploaded file")
-    except Exception as e:
-        logger.warning(f"Could not delete Gemini file: {e}")
+        for stream in json.loads(probe.stdout).get('streams', []):
+            if 'duration' in stream:
+                return float(stream['duration'])
+    except Exception:
+        pass
 
-    if transcription is None:
-        raise RuntimeError(f"All transcription models failed. Last error: {last_error}")
-
-    return transcription
+    # Fallback: format-level duration
+    probe2 = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path],
+        capture_output=True, text=True
+    )
+    try:
+        return float(json.loads(probe2.stdout).get('format', {}).get('duration', 0))
+    except Exception:
+        return 0
 
 
 async def transcribe_with_chirp(mp3_path: str) -> str:
-    """Transcribe audio using Google Cloud Speech-to-Text Chirp 3 model.
-    Splits audio into 55-second chunks to stay under the 60s API limit.
-    Fallback used only when GOOGLE_CLOUD_CREDENTIALS is set but GEMINI_API_KEY is not.
+    """Transcribe audio using Google Cloud Speech-to-Text Chirp 3.
+
+    Each 55-second chunk is extracted via ffmpeg directly from disk — the full
+    audio file is never loaded into RAM, so there is no memory limit and no
+    truncation regardless of recording length.
     """
     import json
     from google.cloud.speech_v2 import SpeechClient
@@ -154,25 +95,39 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
     )
     recognizer_path = f"projects/{project_id}/locations/us/recognizers/_"
 
-    # Split into 55-second chunks (API hard limit is 60s per request)
-    audio = AudioSegment.from_file(mp3_path)
-    CHUNK_MS = 55 * 1000
-    chunks = [audio[i:i + CHUNK_MS] for i in range(0, len(audio), CHUNK_MS)]
-    logger.info(f"Transcribing {len(chunks)} chunk(s) with Chirp 3...")
+    # Determine total duration without loading the file into memory
+    duration_secs = _get_audio_duration_secs(mp3_path)
+    CHUNK_SECS = 55
+    num_chunks = max(1, math.ceil(duration_secs / CHUNK_SECS))
+    logger.info(f"Audio: {duration_secs:.1f}s — {num_chunks} chunk(s) for Chirp 3")
 
     loop = asyncio.get_running_loop()
     all_lines = []
     last_timestamp_seconds = -120  # force first timestamp at [0:00]
 
-    for idx, chunk in enumerate(chunks):
-        chunk_offset_secs = idx * 55
+    for idx in range(num_chunks):
+        chunk_offset_secs = idx * CHUNK_SECS
 
-        # Export chunk to a low-bitrate temp file (16kbps mono — enough for STT)
+        # Extract this 55-second window with ffmpeg — reads only that slice,
+        # never the whole file, keeping RAM usage constant regardless of length
         tmp = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
         tmp.close()
         try:
-            chunk.export(tmp.name, format="mp3", bitrate="16k",
-                         parameters=["-ar", "16000", "-ac", "1"])
+            result = subprocess.run(
+                [
+                    'ffmpeg', '-y',
+                    '-ss', str(chunk_offset_secs),   # fast seek (before -i)
+                    '-t', str(CHUNK_SECS),
+                    '-i', mp3_path,
+                    '-ar', '16000', '-ac', '1', '-b:a', '16k',
+                    '-f', 'mp3', tmp.name
+                ],
+                capture_output=True
+            )
+            if result.returncode != 0 or os.path.getsize(tmp.name) < 500:
+                logger.info(f"Chunk {idx + 1}/{num_chunks}: empty or ffmpeg error — skipping")
+                continue
+
             with open(tmp.name, 'rb') as f:
                 chunk_bytes = f.read()
         finally:
@@ -190,19 +145,19 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
                 None, lambda r=request: client.recognize(request=r)
             )
         except Exception as chunk_err:
-            logger.error(f"Chunk {idx + 1}/{len(chunks)} failed: {chunk_err}")
-            all_lines.append(f"[chunk {idx + 1} failed: {chunk_err}]")
+            logger.error(f"Chunk {idx + 1}/{num_chunks} failed: {chunk_err}")
+            all_lines.append(f"[chunk {idx + 1} error: {chunk_err}]")
             continue
 
-        for result in response.results:
-            if not result.alternatives:
+        for res in response.results:
+            if not res.alternatives:
                 continue
-            best = result.alternatives[0]
+            best = res.alternatives[0]
             text = best.transcript.strip()
             if not text:
                 continue
 
-            # Timestamp every ~2 minutes, adjusted for chunk offset
+            # Timestamp every ~2 minutes (absolute position = chunk offset + word offset)
             if best.words:
                 try:
                     offset = best.words[0].start_offset
@@ -220,6 +175,8 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
                     pass
 
             all_lines.append(text)
+
+        logger.info(f"Chunk {idx + 1}/{num_chunks} done")
 
     return "\n".join(all_lines) if all_lines else "No speech detected in audio"
 
@@ -280,14 +237,13 @@ async def send_long_text(message, header: str, body: str, parse_mode: str = 'Mar
         await message.reply_text(full, parse_mode=parse_mode)
         return
 
-    # Send header alone, then body in chunks
     await message.reply_text(header, parse_mode=parse_mode)
     remaining = body
     part = 1
     while remaining:
         chunk = remaining[:LIMIT]
         remaining = remaining[LIMIT:]
-        suffix = f"\n\n_(continued {part})_" if remaining else ""
+        suffix = f"\n\n_(part {part})_" if remaining else ""
         await message.reply_text(chunk + suffix)
         part += 1
 
@@ -350,7 +306,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             duration_mins = len(audio) / 60000
 
             # transcription_mp3_path always points to the FULL audio file
-            # (may differ from what was sent to Telegram if the file was split)
+            # (may differ from what was sent to Telegram if split)
             transcription_mp3_path = None
             mp3_sent = False
 
@@ -370,7 +326,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"✅ High Quality MP3 (128k)\n📁 {file_size_mb:.2f} MB | ⏱ {duration_mins:.1f} min"
                     )
                 await status_message.delete()
-                transcription_mp3_path = output_path  # Full file
+                transcription_mp3_path = output_path
                 mp3_sent = True
                 logger.info(f"✅ Sent 128k MP3: {output_filename}")
 
@@ -430,37 +386,30 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     await status_message.delete()
 
-                    # Use the compressed file if the export succeeded but was too large for Telegram
-                    # (Gemini Files API can handle it — 2 GB limit). Otherwise fall back to part 1.
+                    # Use compressed file for transcription if export succeeded
+                    # (it exists but was too large for Telegram — Chirp reads it chunk-by-chunk)
                     if os.path.exists(compressed_path):
-                        transcription_mp3_path = compressed_path  # Full audio
-                        logger.info("Using full compressed file for transcription (too large for Telegram but fine for Gemini)")
+                        transcription_mp3_path = compressed_path
                     else:
-                        transcription_mp3_path = part1_path  # Fallback: first half only
-                        logger.warning("Compressed export failed — transcribing first half only")
-
+                        transcription_mp3_path = part1_path
                     mp3_sent = True
                     logger.info(f"✅ Sent in 2 parts: {output_filename}")
 
-            # ── Transcribe ────────────────────────────────────────────────
-            if mp3_sent and transcription_mp3_path:
-                gemini_key = os.getenv('GEMINI_API_KEY')
-                chirp_creds = os.getenv('GOOGLE_CLOUD_CREDENTIALS')
+            # ── Transcribe (Chirp 3) ──────────────────────────────────────
+            if mp3_sent and transcription_mp3_path and os.getenv('GOOGLE_CLOUD_CREDENTIALS'):
+                transcription_status = await message.reply_text(
+                    "🎙️ Transcribing with Chirp 3 (Google Cloud)...\n"
+                    "⏳ Please wait — this takes 1–3 minutes for longer files"
+                )
+                try:
+                    transcription = await transcribe_with_chirp(transcription_mp3_path)
+                    await transcription_status.delete()
 
-                if gemini_key:
-                    # PRIMARY: Gemini Files API — handles any length, no memory issues
-                    transcription_status = await message.reply_text(
-                        "🎙️ Transcribing with Gemini AI...\n"
-                        "⏳ Please wait — this takes 2–5 min for long files"
-                    )
-                    try:
-                        transcription = await transcribe_with_gemini_files(transcription_mp3_path)
-                        await transcription_status.delete()
+                    header = f"📝 *Transcription* — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
+                    await send_long_text(message, header, transcription)
 
-                        header = f"📝 *Transcription* — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
-                        await send_long_text(message, header, transcription)
-
-                        # ── Summary ──────────────────────────────────────
+                    # ── Summary (optional, only if GEMINI_API_KEY is set) ──
+                    if os.getenv('GEMINI_API_KEY'):
                         summary_status = await message.reply_text(
                             "🤖 Generating AI summary with Gemini..."
                         )
@@ -477,33 +426,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             logger.error(f"Summary error: {sum_error}", exc_info=True)
 
-                    except Exception as trans_error:
-                        await transcription_status.edit_text(
-                            f"❌ Transcription failed: {str(trans_error)}\n\n"
-                            f"✅ MP3 was still sent above"
-                        )
-                        logger.error(f"Transcription error: {trans_error}", exc_info=True)
-
-                elif chirp_creds:
-                    # FALLBACK: Chirp 3 (Google Cloud) — only if no GEMINI_API_KEY
-                    transcription_status = await message.reply_text(
-                        "🎙️ Transcribing with Chirp 3 (Google Cloud)...\n"
-                        "⏳ Please wait — this takes 1–3 minutes for longer files"
+                except Exception as trans_error:
+                    await transcription_status.edit_text(
+                        f"❌ Transcription failed: {str(trans_error)}\n\n"
+                        f"✅ MP3 was still sent above"
                     )
-                    try:
-                        transcription = await transcribe_with_chirp(transcription_mp3_path)
-                        await transcription_status.delete()
-                        header = f"📝 *Transcription* — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
-                        await send_long_text(message, header, transcription)
-                    except Exception as trans_error:
-                        await transcription_status.edit_text(
-                            f"❌ Transcription failed: {str(trans_error)}\n\n"
-                            f"✅ MP3 was still sent above"
-                        )
-                        logger.error(f"Transcription error: {trans_error}", exc_info=True)
+                    logger.error(f"Transcription error: {trans_error}", exc_info=True)
 
-                else:
-                    logger.warning("No transcription service configured — skipping transcription")
+            elif mp3_sent and not os.getenv('GOOGLE_CLOUD_CREDENTIALS'):
+                logger.warning("GOOGLE_CLOUD_CREDENTIALS not set — skipping transcription")
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
@@ -520,8 +451,8 @@ def main():
         logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
 
-    has_gemini = bool(os.getenv('GEMINI_API_KEY'))
     has_chirp = bool(os.getenv('GOOGLE_CLOUD_CREDENTIALS'))
+    has_gemini = bool(os.getenv('GEMINI_API_KEY'))
 
     application = Application.builder().token(token).build()
     application.add_handler(MessageHandler(
@@ -531,15 +462,8 @@ def main():
 
     logger.info("🤖 Bot starting...")
     logger.info("✅ MP3 conversion: Ready")
-    if has_gemini:
-        logger.info("✅ Transcription: Gemini Files API (primary) — handles any length audio")
-        logger.info("✅ Summary: Gemini AI")
-    elif has_chirp:
-        logger.info("✅ Transcription: Chirp 3 (Google Cloud Speech) — fallback")
-        logger.info("⚠️  Summary: disabled (GEMINI_API_KEY not set)")
-    else:
-        logger.info("⚠️  Transcription: disabled (set GEMINI_API_KEY or GOOGLE_CLOUD_CREDENTIALS)")
-
+    logger.info(f"{'✅' if has_chirp else '⚠️ '} Chirp 3 transcription: {'Ready (ffmpeg chunking — no memory limit)' if has_chirp else 'GOOGLE_CLOUD_CREDENTIALS not set'}")
+    logger.info(f"{'✅' if has_gemini else '⚠️ '} Gemini summary: {'Ready' if has_gemini else 'GEMINI_API_KEY not set — summary disabled'}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
