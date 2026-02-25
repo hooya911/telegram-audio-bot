@@ -46,8 +46,38 @@ async def transcribe_with_chirp(mp3_path: str) -> str:
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )
 
-    with open(mp3_path, 'rb') as f:
-        audio_bytes = f.read()
+    STT_LIMIT_BYTES = 10 * 1024 * 1024  # 10 MB inline limit for Chirp 3
+    stt_path = mp3_path
+    tmp_stt = None
+
+    if os.path.getsize(mp3_path) > STT_LIMIT_BYTES:
+        from pydub import AudioSegment
+        import tempfile
+        audio = AudioSegment.from_file(mp3_path)
+        tmp_stt = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+        tmp_stt.close()
+        # 16kbps mono 16kHz — enough for STT, ~87 min fits in 10MB
+        audio.export(tmp_stt.name, format="mp3", bitrate="16k",
+                     parameters=["-ar", "16000", "-ac", "1"])
+        compressed_size = os.path.getsize(tmp_stt.name)
+        if compressed_size > STT_LIMIT_BYTES:
+            os.unlink(tmp_stt.name)
+            raise ValueError(
+                f"Audio is too long to transcribe (~{compressed_size/1024/1024:.0f} MB even at minimum quality). "
+                f"Maximum is ~90 minutes."
+            )
+        logger.info(
+            f"Compressed for STT: {os.path.getsize(mp3_path)/1024/1024:.1f} MB "
+            f"→ {compressed_size/1024/1024:.1f} MB"
+        )
+        stt_path = tmp_stt.name
+
+    try:
+        with open(stt_path, 'rb') as f:
+            audio_bytes = f.read()
+    finally:
+        if tmp_stt and os.path.exists(tmp_stt.name):
+            os.unlink(tmp_stt.name)
 
     loop = asyncio.get_event_loop()
 
