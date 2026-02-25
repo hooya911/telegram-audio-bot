@@ -9,7 +9,6 @@ import os
 import logging
 import tempfile
 import asyncio
-from functools import partial
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from pydub import AudioSegment
@@ -25,80 +24,93 @@ logger = logging.getLogger(__name__)
 SUPPORTED_FORMATS = ['.m4a', '.ogg', '.opus', '.wav', '.aac', '.flac', '.wma', '.mp3']
 
 
-async def transcribe_with_gemini(mp3_path: str) -> str:
-    """Upload MP3 to Gemini and transcribe Farsi+English audio"""
-    import google.generativeai as genai
-    import time
+async def transcribe_with_chirp(mp3_path: str) -> str:
+    """Transcribe audio using Google Cloud Speech-to-Text Chirp 3 model"""
+    import json
+    from google.cloud.speech_v2 import SpeechClient
+    from google.cloud.speech_v2.types import cloud_speech
+    from google.api_core.client_options import ClientOptions
+    from google.oauth2 import service_account
 
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is not set")
+    credentials_json = os.getenv('GOOGLE_CLOUD_CREDENTIALS')
+    if not credentials_json:
+        raise ValueError("GOOGLE_CLOUD_CREDENTIALS environment variable is not set")
 
-    genai.configure(api_key=api_key)
+    credentials_info = json.loads(credentials_json)
+    project_id = credentials_info.get('project_id')
+    if not project_id:
+        raise ValueError("project_id not found in GOOGLE_CLOUD_CREDENTIALS")
+
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+
+    with open(mp3_path, 'rb') as f:
+        audio_bytes = f.read()
+
     loop = asyncio.get_event_loop()
 
-    # Step 1: Upload file to Gemini Files API
-    logger.info("Uploading file to Gemini Files API...")
-
-    def upload_file():
-        return genai.upload_file(mp3_path, mime_type="audio/mpeg")
-
-    audio_file = await loop.run_in_executor(None, upload_file)
-    logger.info(f"File uploaded: {audio_file.name}, state: {audio_file.state.name}")
-
-    # Step 2: Wait for Gemini to process the file
-    def wait_for_processing(f):
-        attempts = 0
-        while f.state.name == "PROCESSING" and attempts < 30:
-            time.sleep(3)
-            f = genai.get_file(f.name)
-            attempts += 1
-            logger.info(f"File state: {f.state.name} (attempt {attempts})")
-        return f
-
-    audio_file = await loop.run_in_executor(None, partial(wait_for_processing, audio_file))
-
-    if audio_file.state.name == "FAILED":
-        raise Exception("Gemini failed to process the audio file")
-
-    # Step 3: Transcribe
-    logger.info("Sending to Gemini for transcription...")
-
-    model = genai.GenerativeModel('gemini-2.0-flash')
-
-    prompt = """Please transcribe this audio file exactly as spoken.
-
-Important instructions:
-- The audio contains a mix of Farsi (Persian) and English
-- Write Farsi words in Persian script (فارسی) — do NOT romanize
-- Write English words in English
-- Do NOT translate anything — transcribe exactly what is said
-- Keep the original language of each word/sentence
-- Add a timestamp every ~2 minutes like [0:00], [2:00], [4:00] etc.
-- If there are multiple speakers, indicate with Speaker 1:, Speaker 2: etc. if noticeable
-
-Transcribe now:"""
-
     def do_transcribe():
-        response = model.generate_content(
-            [prompt, audio_file],
-            request_options={"timeout": 300}  # 5 min timeout
+        client_options = ClientOptions(api_endpoint="us-speech.googleapis.com")
+        client = SpeechClient(
+            credentials=credentials,
+            client_options=client_options
         )
-        return response.text
 
-    transcription = await loop.run_in_executor(None, do_transcribe)
+        config = cloud_speech.RecognitionConfig(
+            auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
+            model="chirp_3",
+            language_codes=["fa-IR", "en-US"],
+            features=cloud_speech.RecognitionFeatures(
+                enable_automatic_punctuation=True,
+                enable_word_time_offsets=True,
+            ),
+        )
 
-    # Step 4: Cleanup — delete uploaded file from Gemini
-    def cleanup():
-        try:
-            genai.delete_file(audio_file.name)
-            logger.info(f"Deleted Gemini file: {audio_file.name}")
-        except Exception as e:
-            logger.warning(f"Could not delete Gemini file: {e}")
+        recognizer_path = f"projects/{project_id}/locations/us/recognizers/_"
+        request = cloud_speech.RecognizeRequest(
+            recognizer=recognizer_path,
+            config=config,
+            content=audio_bytes
+        )
 
-    await loop.run_in_executor(None, cleanup)
+        logger.info("Sending audio to Chirp 3 (Google Cloud Speech-to-Text)...")
+        return client.recognize(request=request)
 
-    return transcription
+    response = await loop.run_in_executor(None, do_transcribe)
+
+    # Assemble transcription with timestamps every ~2 minutes
+    lines = []
+    last_timestamp_seconds = -120  # Force first timestamp at [0:00]
+
+    for result in response.results:
+        if not result.alternatives:
+            continue
+        best = result.alternatives[0]
+        text = best.transcript.strip()
+        if not text:
+            continue
+
+        # Insert timestamp every ~2 minutes using word timing
+        if best.words:
+            try:
+                offset = best.words[0].start_offset
+                if hasattr(offset, 'total_seconds'):
+                    start_secs = int(offset.total_seconds())
+                else:
+                    start_secs = int(offset.seconds + offset.nanos / 1e9)
+                if start_secs - last_timestamp_seconds >= 120:
+                    mins = start_secs // 60
+                    secs = start_secs % 60
+                    lines.append(f"[{mins}:{secs:02d}]")
+                    last_timestamp_seconds = start_secs
+            except Exception:
+                pass
+
+        lines.append(text)
+
+    return "\n".join(lines) if lines else "No speech detected in audio"
 
 
 async def send_transcription(message, transcription: str, duration_mins: float):
@@ -267,13 +279,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"✅ Sent in 2 parts: {output_filename}")
 
             # ── Transcribe ────────────────────────────────────────────────
-            if mp3_sent and final_mp3_path and os.getenv('GEMINI_API_KEY'):
+            if mp3_sent and final_mp3_path and os.getenv('GOOGLE_CLOUD_CREDENTIALS'):
                 transcription_status = await message.reply_text(
-                    "🎙️ Transcribing with Gemini AI...\n"
+                    "🎙️ Transcribing with Chirp 3 (Google Cloud)...\n"
                     "⏳ Please wait — this takes 1–3 minutes for longer files"
                 )
                 try:
-                    transcription = await transcribe_with_gemini(final_mp3_path)
+                    transcription = await transcribe_with_chirp(final_mp3_path)
                     await transcription_status.delete()
                     await send_transcription(message, transcription, duration_mins)
 
@@ -284,8 +296,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     logger.error(f"Transcription error: {trans_error}", exc_info=True)
 
-            elif mp3_sent and not os.getenv('GEMINI_API_KEY'):
-                logger.warning("GEMINI_API_KEY not set — skipping transcription")
+            elif mp3_sent and not os.getenv('GOOGLE_CLOUD_CREDENTIALS'):
+                logger.warning("GOOGLE_CLOUD_CREDENTIALS not set — skipping transcription")
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
@@ -302,7 +314,7 @@ def main():
         logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
 
-    has_gemini = bool(os.getenv('GEMINI_API_KEY'))
+    has_chirp = bool(os.getenv('GOOGLE_CLOUD_CREDENTIALS'))
 
     application = Application.builder().token(token).build()
     application.add_handler(MessageHandler(
@@ -312,7 +324,7 @@ def main():
 
     logger.info("🤖 Bot starting...")
     logger.info("✅ MP3 conversion: Ready")
-    logger.info(f"{'✅' if has_gemini else '⚠️ '} Gemini transcription: {'Ready' if has_gemini else 'GEMINI_API_KEY not set — transcription disabled'}")
+    logger.info(f"{'✅' if has_chirp else '⚠️ '} Chirp 3 transcription: {'Ready' if has_chirp else 'GOOGLE_CLOUD_CREDENTIALS not set — transcription disabled'}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
