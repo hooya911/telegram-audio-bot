@@ -64,7 +64,7 @@ async def transcribe_with_gemini(mp3_path: str) -> str:
     # Step 3: Transcribe
     logger.info("Sending to Gemini for transcription...")
 
-    model = genai.GenerativeModel('gemini-1.5-pro')
+    model = genai.GenerativeModel('gemini-2.0-flash')
 
     prompt = """Please transcribe this audio file exactly as spoken.
 
