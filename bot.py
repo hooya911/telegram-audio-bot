@@ -141,7 +141,6 @@ async def summarize_with_gemini(transcription: str, duration_mins: float) -> str
         raise ValueError("GEMINI_API_KEY is not set")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
 
     prompt = f"""You are summarizing a {duration_mins:.1f}-minute audio recording that was transcribed from mixed Farsi and English speech.
 
@@ -155,11 +154,30 @@ Write a detailed summary of everything discussed. Follow these rules:
 - Keep it concise but comprehensive (not a word-for-word repeat)
 - If the audio is mostly Farsi, write the summary mostly in Farsi; if mostly English, mostly English"""
 
+    # Try models in order of preference — fall back if one is unavailable
+    candidate_models = [
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash-001",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+
     loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None, lambda: model.generate_content(prompt)
-    )
-    return response.text.strip()
+    last_error = None
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = await loop.run_in_executor(
+                None, lambda m=model: m.generate_content(prompt)
+            )
+            logger.info(f"Summary generated using model: {model_name}")
+            return response.text.strip()
+        except Exception as e:
+            logger.warning(f"Model {model_name} failed: {e}")
+            last_error = e
+            continue
+
+    raise RuntimeError(f"All summary models failed. Last error: {last_error}")
 
 
 async def send_transcription(message, transcription: str, duration_mins: float):
