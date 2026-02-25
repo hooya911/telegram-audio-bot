@@ -9,8 +9,14 @@ __pycache__/
 telegram-audio-bot/
 
 # Credentials (never commit these)
-*.json
 google-credentials.json
+*credentials*.json
+*service-account*.json
+
+# Sensitive text files
+Token telegram.txt
+token*.txt
+*token*.txt
 
 # OS files
 .DS_Store
